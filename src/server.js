@@ -12,6 +12,8 @@ import {
   strategyCommitment,
   publicInputsHash,
   buildStealCircuitInput,
+  uuidFromHex,
+  fortifiedFlag,
   ACTION_NAMES,
   DEFAULT_PARAMS,
   DEFAULT_SALT,
@@ -154,12 +156,16 @@ async function handleStealTurn(task, res) {
 
   const actionObj = { type: ACTION_NAMES[action] };
   if (action === 2) actionObj.amount = Number(amount);
+  // Response schema per the official starter prompt: proof and
+  // public_signals are TOP-LEVEL; policyProof carries only circuitVersion,
+  // proofReference and publicInputsHash; idempotencyKey must be a uuid.
   const response = {
     matchId,
     turn,
     action: actionObj,
+    policyProof: { circuitVersion: "v1" },
     agentTimestamp: new Date().toISOString(),
-    idempotencyKey: signBody(key, SECRET || "no-secret"),
+    idempotencyKey: uuidFromHex(signBody(key, SECRET || "no-secret")),
   };
 
   try {
@@ -178,24 +184,27 @@ async function handleStealTurn(task, res) {
       generateProof(circuitInput, STEAL_WASM, STEAL_ZKEY),
       PROOF_BUDGET_MS
     );
+    const inputsHash = publicInputsHash({
+      matchId,
+      turn,
+      action,
+      amount,
+      selfBalance,
+      opponentBalance,
+      selfFortified: fortifiedFlag(st.selfFortifiedUntilTurn, turn),
+      opponentFortified: fortifiedFlag(st.opponentFortifiedUntilTurn, turn),
+      publicSignals,
+    });
+    response.proof = proof;
+    response.public_signals = publicSignals;
     response.policyProof = {
       circuitVersion: "v1",
-      proof,
-      public_signals: publicSignals,
-      publicInputsHash: publicInputsHash({
-        commitment: STEAL_COMMITMENT,
-        matchId,
-        turn,
-        selfBalance,
-        opponentBalance,
-        action,
-        amount,
-      }),
+      proofReference: inputsHash,
+      publicInputsHash: inputsHash,
     };
   } catch (e) {
     // Degrade gracefully: the platform treats a proof-less turn as HOLD.
     console.error(`[steal ${matchId} turn ${turn}] proof generation failed: ${e.message}`);
-    response.policyProof = { circuitVersion: "v1" };
   }
 
   const body = JSON.stringify(response);
@@ -208,7 +217,7 @@ async function handleStealTurn(task, res) {
   res.end(body);
   console.log(
     `[steal ${matchId} turn ${turn}] ${ACTION_NAMES[action]}${action === 2 ? " " + amount : ""}` +
-      (response.policyProof.proof ? " +proof" : " (no proof)")
+      (response.proof ? " +proof" : " (no proof)")
   );
 }
 
@@ -282,7 +291,7 @@ const server = http.createServer((req, res) => {
               action: { type: "HOLD" },
               policyProof: { circuitVersion: "v1" },
               agentTimestamp: new Date().toISOString(),
-              idempotencyKey: signBody(`steal:${task.matchId}:${task.turn}`, SECRET || "no-secret"),
+              idempotencyKey: uuidFromHex(signBody(`steal:${task.matchId}:${task.turn}`, SECRET || "no-secret")),
             });
           } else {
             sendSigned(res, { decision: "REJECT", reason_code: "VK_SUBSTITUTION" });

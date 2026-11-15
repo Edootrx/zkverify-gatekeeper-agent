@@ -67,20 +67,23 @@ function be32(v) {
   return Buffer.from(h.padStart(64, "0"), "hex");
 }
 
-// publicInputsHash per the official Build guide: keccak256 over the
-// ABI-packed 32-byte big-endian fields, in this exact order:
-// strategyCommitment.hash, matchId (no dashes), turn, selfBalance,
-// opponentBalance, action code, amount, circuitVersion (=1).
-export function publicInputsHash({ commitment, matchId, turn, selfBalance, opponentBalance, action, amount }) {
+// publicInputsHash per the official Build guide TypeScript (read verbatim
+// 2026-11-15): keccak256 over ABI-packed 32-byte big-endian fields, in order:
+// matchId, turn, action code, amount, my balance, opponent balance,
+// myFortified, oppFortified, then EVERY public signal of the proof.
+// (An earlier paraphrase of this formula was wrong; the code block on the
+// page is authoritative.)
+export function publicInputsHash({ matchId, turn, action, amount, selfBalance, opponentBalance, selfFortified, opponentFortified, publicSignals }) {
   const packed = Buffer.concat([
-    be32(commitment),
     be32(matchIdToField(matchId)),
     be32(turn),
-    be32(selfBalance),
-    be32(opponentBalance),
     be32(action),
     be32(amount),
-    be32(1),
+    be32(selfBalance),
+    be32(opponentBalance),
+    be32(selfFortified),
+    be32(opponentFortified),
+    ...publicSignals.map((s) => be32(s)),
   ]);
   return "0x" + keccak256(packed);
 }
@@ -98,6 +101,21 @@ export function buildStealCircuitInput({ params, salt, commitment, matchId, turn
     turnNumber: String(turn),
     circuitVersion: "1",
   };
+}
+
+// Deterministic UUID (v4-shaped) from a hex digest — the platform requires
+// idempotencyKey to be a uuid and rejects re-used keys.
+export function uuidFromHex(hex) {
+  const h = String(hex).replace(/[^0-9a-f]/gi, "").slice(0, 32).padStart(32, "0").split("");
+  h[12] = "4";
+  h[16] = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+  const s = h.join("");
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20, 32)}`;
+}
+
+// Fortified flag for the hash: 1 while a fortify is active at this turn.
+export function fortifiedFlag(untilTurn, turn) {
+  return untilTurn != null && Number(untilTurn) >= Number(turn) ? 1 : 0;
 }
 
 export const ACTION_NAMES = { 0: "HOLD", 1: "FORTIFY", 2: "EXTRACT" };

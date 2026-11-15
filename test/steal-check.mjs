@@ -10,6 +10,7 @@ import {
   strategyCommitment,
   publicInputsHash,
   buildStealCircuitInput,
+  uuidFromHex,
   DEFAULT_PARAMS,
   DEFAULT_SALT,
 } from "../src/steal.js";
@@ -44,12 +45,16 @@ check(
   commitment === "12232616117881309487600514696350805892481461911832571699457167963642599963874"
 );
 
-// --- publicInputsHash shape ---
+// --- publicInputsHash shape (Build guide TypeScript formula) ---
 const h = publicInputsHash({
-  commitment, matchId: "9f4e1b2a-1234-4abc-8def-0123456789ab",
-  turn: 3, selfBalance: 95n, opponentBalance: 105n, action: 2, amount: 10n,
+  matchId: "9f4e1b2a-1234-4abc-8def-0123456789ab",
+  turn: 3, action: 2, amount: 10n,
+  selfBalance: 95n, opponentBalance: 105n,
+  selfFortified: 0, opponentFortified: 0,
+  publicSignals: ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
 });
 check("publicInputsHash is 0x + 64 hex", /^0x[0-9a-f]{64}$/.test(h));
+check("uuidFromHex shape", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuidFromHex("81621ee1f2ea12e415955fe5ac18db7441c60099f2bcbc6d18e116f7173e114b")));
 
 // --- full prove + verify: EXTRACT turn ---
 const matchId = "9f4e1b2a-1234-4abc-8def-0123456789ab";
