@@ -201,6 +201,7 @@ async function handleStealTurn(task, res) {
   const body = JSON.stringify(response);
   state.setResponse(key, body);
   state.save();
+  if (process.env.DEBUG_STEAL === "1") console.log("[steal-debug] response:", body.slice(0, 2000));
   const headers = { "content-type": "application/json" };
   if (SECRET) headers["x-agent-games-signature"] = signBody(body, SECRET);
   res.writeHead(200, headers);
@@ -261,6 +262,8 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (task.eventId === "steal-the-vfy" || (task.matchId && task.state)) {
+        if (process.env.DEBUG_STEAL === "1")
+          console.log("[steal-debug] request:", raw.toString("utf8").slice(0, 2000));
         await handleStealTurn(task, res);
         return;
       }
