@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { signBody, verifySignature } from "./hmac.js";
 import { decide } from "./decision.js";
 import { StateStore } from "./state.js";
-import { buildCircuitInput, generateProof, submitToKurier } from "./prover.js";
+import { buildCircuitInput, generateProof, registerVk, submitToKurier } from "./prover.js";
 import {
   initPoseidon,
   stealPolicy,
@@ -34,6 +34,9 @@ const VK_HASH =
   "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0";
 const KURIER_API_KEY = process.env.KURIER_API_KEY || "";
 const USE_KURIER = process.env.SUBMIT_TO_KURIER === "1" && KURIER_API_KEY;
+// Full verification key JSON (public by design — the platform publishes its
+// hash). Needed once: Kurier requires register-vk before submit-proof.
+const VK_JSON = process.env.GATEKEEPER_VKEY || path.join(ROOT, "circuits", "gatekeeper.vkey.json");
 const STEAL_WASM = process.env.STEAL_WASM || path.join(ROOT, "circuits", "vfy-policy.wasm");
 const STEAL_ZKEY = process.env.STEAL_ZKEY || path.join(ROOT, "circuits", "vfy-policy_final.zkey");
 const STEAL_PARAMS = (process.env.STEAL_PARAMS || DEFAULT_PARAMS.join(","))
@@ -55,6 +58,22 @@ for (const f of [WASM, ZKEY]) {
 }
 
 const state = new StateStore(STATE_FILE);
+
+// One-time Kurier verification-key registration. Kurier requires register-vk
+// before submit-proof (docs: "first confirm that register-vk successfully
+// returned the vk hash"). Runs once per boot, before listening; a failure is
+// logged and never blocks boot — tasks still answer with their (locally
+// valid) proof, just without an on-chain reference.
+async function registerGatekeeperVk() {
+  if (!USE_KURIER) return;
+  try {
+    const vk = JSON.parse(fs.readFileSync(VK_JSON, "utf8"));
+    const data = await registerVk(vk, KURIER_API_KEY);
+    console.log(`Kurier vk registered: ${data.vkHash || data.hash || "ok"}`);
+  } catch (e) {
+    console.error(`Kurier register-vk failed (proofs will lack on-chain refs): ${e.message}`);
+  }
+}
 
 function sendSigned(res, obj) {
   const body = JSON.stringify(obj);
@@ -105,9 +124,13 @@ async function handleTask(task, res) {
       response.public_signals = publicSignals;
       if (USE_KURIER) {
         try {
-          const job = await submitToKurier(proof, publicSignals, VK_HASH, KURIER_API_KEY, 15000);
-          if (job && (job.txHash || job.transactionHash))
-            response.proof_reference = job.txHash || job.transactionHash;
+          const kurier = await submitToKurier(proof, publicSignals, VK_HASH, KURIER_API_KEY, 30000);
+          if (kurier.txHash) {
+            response.proof_reference = kurier.txHash;
+            console.log(`[task ${taskId}] Kurier ${kurier.status}: ${kurier.txHash}`);
+          } else {
+            console.error(`[task ${taskId}] Kurier not anchored in time (status ${kurier.status}; proof still returned)`);
+          }
         } catch (e) {
           console.error(`[task ${taskId}] Kurier submit failed (proof still returned): ${e.message}`);
         }
@@ -310,6 +333,7 @@ initPoseidon()
     console.log(`Steal the VFY: params=[${STEAL_PARAMS.join(",")}] commitment=${STEAL_COMMITMENT}`);
   })
   .catch((e) => console.error("Steal poseidon init failed (Steal turns will lack proofs):", e.message))
+  .then(() => registerGatekeeperVk())
   .finally(() => {
     server.listen(PORT, () => {
       console.log(`Proof Gatekeeper agent listening on :${PORT}${AGENT_PATH} (health: /health)`);

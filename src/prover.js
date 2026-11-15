@@ -83,10 +83,47 @@ export async function generateProof(circuitInput, wasmPath, zkeyPath) {
   return { proof, publicSignals };
 }
 
-// Optional: submit the proof to zkVerify via Kurier and wait briefly for a
-// finalized reference. OFF by default — the platform re-verifies the proof
-// from our response itself; proof_tx in the response is only an audit pointer.
-export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 20000) {
+// Kurier (zkVerify REST API) — REQUIRED for scored rounds, not optional.
+// The platform's "VERIFIED PROOFS" counter counts proofs confirmed ON-CHAIN,
+// and a provable task without an on-chain-confirmed proof scores -2 even when
+// the decision is correct (Round 3: 8x correct decisions, 0 verified, 80.0
+// points = 8 x (+12 - 2)). The proof itself is still returned to the platform
+// in every case; Kurier only adds the on-chain proof_reference.
+//
+// Flow per docs.zkverify.io/overview/getting-started/kurier:
+//   1. register-vk ONCE per verification key (full vk JSON, not just the hash)
+//   2. submit-proof -> { jobId, optimisticVerify: 'success' }
+//   3. poll job-status until Finalized (example: ~16s) — txHash is present on
+//      the Finalized status object (and per the tutorial, tx data is returned
+//      once the job reaches IncludedInBlock).
+// Enable with env SUBMIT_TO_KURIER=1 + KURIER_API_KEY (free key from kurier.xyz).
+export async function registerVk(vk, apiKey, timeoutMs = 15000) {
+  const API = "https://api.kurier.xyz/api/v1";
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${API}/register-vk/${apiKey}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        proofType: "groth16",
+        proofOptions: { library: "snarkjs", curve: "bn128" },
+        vk,
+      }),
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data.message || data.error || JSON.stringify(data).slice(0, 200);
+      throw new Error(`Kurier register-vk HTTP ${res.status}: ${msg}`);
+    }
+    return data; // contains vkHash (or the already-registered vkHash)
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 30000) {
   const API = "https://api.kurier.xyz/api/v1";
   const res = await fetch(`${API}/submit-proof/${apiKey}`, {
     method: "POST",
@@ -100,16 +137,31 @@ export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeo
   });
   if (!res.ok) throw new Error(`Kurier submit HTTP ${res.status}`);
   const job = await res.json();
+  // Optimistic verification runs before the job is queued: anything other than
+  // 'success' means the proof artifacts are wrong and the job will never finalize.
+  if (job.optimisticVerify && job.optimisticVerify !== "success") {
+    throw new Error(`Kurier optimisticVerify=${job.optimisticVerify}`);
+  }
   const jobId = job.jobId || job.id;
-  if (!jobId) return job;
+  if (!jobId) return { txHash: null, status: "no-job-id", job };
   const deadline = Date.now() + timeoutMs;
+  let lastStatus = "Submitted";
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 3000));
     const s = await fetch(`${API}/job-status/${apiKey}/${jobId}`);
     if (!s.ok) continue;
     const st = await s.json();
-    if (st.status === "Finalized" || st.status === "finalized") return st;
+    lastStatus = st.status || lastStatus;
+    // txHash appears once the verification is included in a block; Finalized
+    // is the strongest state. Either is an on-chain reference the platform
+    // can confirm, so return as soon as we have one.
+    if ((st.status === "Finalized" || st.status === "finalized" ||
+         st.status === "IncludedInBlock") && (st.txHash || st.transactionHash)) {
+      return { txHash: st.txHash || st.transactionHash, status: st.status, job: st };
+    }
     if (/fail|error|invalid/i.test(String(st.status))) throw new Error(`Kurier job ${st.status}`);
   }
-  return job; // not finalized in time — caller still returns the proof itself
+  // Not anchored in time — caller still returns the proof itself; the task
+  // will score +12 - 2 instead of +12, but never times out.
+  return { txHash: null, status: lastStatus, job };
 }
