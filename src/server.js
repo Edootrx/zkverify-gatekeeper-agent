@@ -181,7 +181,7 @@ async function handleStealTurn(task, res) {
     response.policyProof = {
       circuitVersion: "v1",
       proof,
-      publicSignals,
+      public_signals: publicSignals,
       publicInputsHash: publicInputsHash({
         commitment: STEAL_COMMITMENT,
         matchId,
