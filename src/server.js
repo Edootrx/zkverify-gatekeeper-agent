@@ -6,6 +6,16 @@ import { signBody, verifySignature } from "./hmac.js";
 import { decide } from "./decision.js";
 import { StateStore } from "./state.js";
 import { buildCircuitInput, generateProof, submitToKurier } from "./prover.js";
+import {
+  initPoseidon,
+  stealPolicy,
+  strategyCommitment,
+  publicInputsHash,
+  buildStealCircuitInput,
+  ACTION_NAMES,
+  DEFAULT_PARAMS,
+  DEFAULT_SALT,
+} from "./steal.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -22,6 +32,13 @@ const VK_HASH =
   "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0";
 const KURIER_API_KEY = process.env.KURIER_API_KEY || "";
 const USE_KURIER = process.env.SUBMIT_TO_KURIER === "1" && KURIER_API_KEY;
+const STEAL_WASM = process.env.STEAL_WASM || path.join(ROOT, "circuits", "vfy-policy.wasm");
+const STEAL_ZKEY = process.env.STEAL_ZKEY || path.join(ROOT, "circuits", "vfy-policy_final.zkey");
+const STEAL_PARAMS = (process.env.STEAL_PARAMS || DEFAULT_PARAMS.join(","))
+  .split(",")
+  .map((s) => s.trim());
+const STEAL_SALT = process.env.STEAL_SALT || DEFAULT_SALT;
+let STEAL_COMMITMENT = null;
 // Hard internal budget: answer well inside the platform's 60s deadline.
 const PROOF_BUDGET_MS = Number(process.env.PROOF_BUDGET_MS || 40000);
 
@@ -117,10 +134,95 @@ async function handleTask(task, res) {
   );
 }
 
+async function handleStealTurn(task, res) {
+  const matchId = task.matchId;
+  const turn = task.turn;
+  const key = `steal:${matchId}:${turn}`;
+  const cached = state.getResponse(key);
+  if (cached) {
+    const headers = { "content-type": "application/json" };
+    if (SECRET) headers["x-agent-games-signature"] = signBody(cached, SECRET);
+    res.writeHead(200, headers);
+    res.end(cached);
+    return;
+  }
+
+  const st = task.state || {};
+  const selfBalance = BigInt(st.selfBalance ?? "0");
+  const opponentBalance = BigInt(st.opponentBalance ?? "0");
+  const { action, amount } = stealPolicy(STEAL_PARAMS, selfBalance, opponentBalance);
+
+  const actionObj = { type: ACTION_NAMES[action] };
+  if (action === 2) actionObj.amount = Number(amount);
+  const response = {
+    matchId,
+    turn,
+    action: actionObj,
+    agentTimestamp: new Date().toISOString(),
+    idempotencyKey: signBody(key, SECRET || "no-secret"),
+  };
+
+  try {
+    const circuitInput = buildStealCircuitInput({
+      params: STEAL_PARAMS,
+      salt: STEAL_SALT,
+      commitment: STEAL_COMMITMENT,
+      matchId,
+      turn,
+      selfBalance,
+      opponentBalance,
+      action,
+      amount,
+    });
+    const { proof, publicSignals } = await withTimeout(
+      generateProof(circuitInput, STEAL_WASM, STEAL_ZKEY),
+      PROOF_BUDGET_MS
+    );
+    response.policyProof = {
+      circuitVersion: "v1",
+      proof,
+      publicSignals,
+      publicInputsHash: publicInputsHash({
+        commitment: STEAL_COMMITMENT,
+        matchId,
+        turn,
+        selfBalance,
+        opponentBalance,
+        action,
+        amount,
+      }),
+    };
+  } catch (e) {
+    // Degrade gracefully: the platform treats a proof-less turn as HOLD.
+    console.error(`[steal ${matchId} turn ${turn}] proof generation failed: ${e.message}`);
+    response.policyProof = { circuitVersion: "v1" };
+  }
+
+  const body = JSON.stringify(response);
+  state.setResponse(key, body);
+  state.save();
+  const headers = { "content-type": "application/json" };
+  if (SECRET) headers["x-agent-games-signature"] = signBody(body, SECRET);
+  res.writeHead(200, headers);
+  res.end(body);
+  console.log(
+    `[steal ${matchId} turn ${turn}] ${ACTION_NAMES[action]}${action === 2 ? " " + amount : ""}` +
+      (response.policyProof.proof ? " +proof" : " (no proof)")
+  );
+}
+
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, agent: "proof-gatekeeper", seen: state.seen.size }));
+    res.end(
+      JSON.stringify({
+        ok: true,
+        agent: "proof-gatekeeper",
+        seen: state.seen.size,
+        stealCommitment: STEAL_COMMITMENT,
+        stealParams: STEAL_PARAMS.map(Number),
+      })
+    );
     return;
   }
   if (req.method !== "POST" || !req.url.startsWith(AGENT_PATH)) {
@@ -158,6 +260,10 @@ const server = http.createServer((req, res) => {
         await handleTask(task, res);
         return;
       }
+      if (task.eventId === "steal-the-vfy" || (task.matchId && task.state)) {
+        await handleStealTurn(task, res);
+        return;
+      }
       // Unknown envelope: fail closed but stay responsive.
       console.error("unknown task type:", task.type);
       sendSigned(res, { decision: "REJECT", reason_code: "VK_SUBSTITUTION" });
@@ -165,7 +271,19 @@ const server = http.createServer((req, res) => {
       console.error("handler error:", e);
       if (!res.headersSent) {
         try {
-          sendSigned(res, { decision: "REJECT", reason_code: "VK_SUBSTITUTION" });
+          if (task && (task.eventId === "steal-the-vfy" || (task.matchId && task.state))) {
+            // Steal fallback: a bare HOLD turn response (never a timeout).
+            sendSigned(res, {
+              matchId: task.matchId,
+              turn: task.turn,
+              action: { type: "HOLD" },
+              policyProof: { circuitVersion: "v1" },
+              agentTimestamp: new Date().toISOString(),
+              idempotencyKey: signBody(`steal:${task.matchId}:${task.turn}`, SECRET || "no-secret"),
+            });
+          } else {
+            sendSigned(res, { decision: "REJECT", reason_code: "VK_SUBSTITUTION" });
+          }
         } catch {
           res.writeHead(500); res.end();
         }
@@ -174,6 +292,14 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Proof Gatekeeper agent listening on :${PORT}${AGENT_PATH} (health: /health)`);
-});
+initPoseidon()
+  .then(() => {
+    STEAL_COMMITMENT = strategyCommitment(STEAL_PARAMS, STEAL_SALT);
+    console.log(`Steal the VFY: params=[${STEAL_PARAMS.join(",")}] commitment=${STEAL_COMMITMENT}`);
+  })
+  .catch((e) => console.error("Steal poseidon init failed (Steal turns will lack proofs):", e.message))
+  .finally(() => {
+    server.listen(PORT, () => {
+      console.log(`Proof Gatekeeper agent listening on :${PORT}${AGENT_PATH} (health: /health)`);
+    });
+  });
