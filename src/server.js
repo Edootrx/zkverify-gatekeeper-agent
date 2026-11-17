@@ -64,6 +64,18 @@ for (const f of [WASM, ZKEY]) {
 
 const state = new StateStore(STATE_FILE);
 
+// Durable PROOF_REUSED memory across deploys: the container filesystem (and
+// with it the state file) is replaced on every deploy, which blinded the
+// seen-set to proofs first used in earlier rounds — Round 5 scored one such
+// cross-round reuse as a wrong APPROVE (-6). SEEN_SEED (comma-separated
+// proof_tx values, recovered from previous deployments' server logs) is
+// merged into the seen-set at boot so a redeploy never resets reuse memory.
+if (process.env.SEEN_SEED) {
+  const seeds = process.env.SEEN_SEED.split(",").map((s) => s.trim()).filter(Boolean);
+  for (const s of seeds) state.markSeen(s);
+  if (seeds.length) console.log(`Seen-set seeded with ${seeds.length} proof_tx values from SEEN_SEED`);
+}
+
 // One-time Kurier verification-key registration. Kurier requires register-vk
 // before submit-proof (docs: "first confirm that register-vk successfully
 // returned the vk hash"). Runs once per boot, before listening; a failure is
@@ -112,8 +124,12 @@ async function handleTask(task, res) {
   // Envelope timing visibility: the platform sets its own deadline_at per
   // task (practice tasks appear to allow far less than the documented 60s).
   // Logged once per task so scored-round latency can be audited afterwards.
+  // proof_tx is logged as well: it is the PROOF_REUSED key, and the log is
+  // the only durable record of it — containers (and their state files) are
+  // replaced on every deploy, so past rounds' proof_tx values can be
+  // backfilled into SEEN_SEED from these lines after any redeploy.
   console.log(
-    `[task ${taskId}] envelope mode=${task.mode || "?"} issued_at=${task.issued_at || "?"} deadline_at=${task.deadline_at || "?"}`
+    `[task ${taskId}] envelope mode=${task.mode || "?"} issued_at=${task.issued_at || "?"} deadline_at=${task.deadline_at || "?"} proof_tx=${input.proof_tx || "?"}`
   );
   const verdict = decide(input, state.seen);
   const response = {
@@ -135,14 +151,18 @@ async function handleTask(task, res) {
       response.proof = proof;
       response.public_signals = publicSignals;
       if (USE_KURIER) {
-        // Wait for the Kurier job to reach Finalized BEFORE responding: the
-        // platform only counts the proof as confirmed on-chain once its
-        // verification is finalized (Build guide; Round 4 returned at
-        // IncludedInBlock and still scored 0 verified). The wait is bounded
-        // by the remaining response budget (and the task's own deadline_at
-        // when present) so it can never cause a platform timeout. The
-        // response keeps exactly the contract fields — the tx hash is
-        // logged here for audit, not added as an extra response field.
+        // Wait for the Kurier job to reach Finalized BEFORE responding, and
+        // put the Kurier tx hash in the response's proof_tx field.
+        // Rationale (Rounds 3–5 evidence): the response used to echo the
+        // input's proof_tx — a pointer at the task's own reference, NOT at
+        // our verification — and VERIFIED PROOFS stayed 0 across all three
+        // rounds (no Kurier at all in R3, IncludedInBlock in R4, Finalized
+        // in R5). proof_tx is the contract's "on-chain audit pointer": the
+        // one field through which the platform can resolve OUR on-chain
+        // verification for this response. The wait stays bounded by the
+        // remaining response budget (and the task's own deadline_at when
+        // present) so it can never cause a platform timeout; if no Kurier
+        // tx exists, proof_tx keeps the input echo as before.
         try {
           let budget = RESPONSE_CAP_MS - (Date.now() - startedAt);
           if (task.deadline_at) {
@@ -151,6 +171,7 @@ async function handleTask(task, res) {
           }
           if (budget > 3000) {
             const kurier = await submitToKurier(proof, publicSignals, VK_HASH, KURIER_API_KEY, budget);
+            if (kurier.txHash) response.proof_tx = kurier.txHash;
             if (kurier.finalized) {
               console.log(`[task ${taskId}] Kurier Finalized: ${kurier.txHash}`);
             } else {
