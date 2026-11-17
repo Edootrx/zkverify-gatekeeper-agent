@@ -75,5 +75,25 @@ mockFetch([
 const none = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 100);
 check("no anchor within budget returns txHash null", none.txHash === null && none.finalized === false, `status=${none.status}`);
 
+// 5. Stall race: first job wedged at Submitted -> a second submission of the
+//    same proof is fired after stallMs, and its Finalized wins the race.
+let submitCount = 0;
+globalThis.fetch = async (url) => {
+  if (url.includes("/submit-proof/")) {
+    submitCount++;
+    return { ok: true, status: 200, json: async () => ({ jobId: `stall-${submitCount}`, optimisticVerify: "success" }) };
+  }
+  if (url.includes("/job-status/") && url.endsWith("stall-1")) {
+    return { ok: true, status: 200, json: async () => ({ jobId: "stall-1", status: "Submitted" }) };
+  }
+  if (url.includes("/job-status/") && url.endsWith("stall-2")) {
+    return { ok: true, status: 200, json: async () => ({ jobId: "stall-2", status: "Finalized", txHash: "0xraced" }) };
+  }
+  throw new Error("unexpected fetch " + url);
+};
+const raced = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 20000, 3000);
+check("stalled first job triggers a second submission", submitCount === 2, `submits=${submitCount}`);
+check("second job's Finalized wins the race", raced.finalized === true && raced.txHash === "0xraced", `status=${raced.status} tx=${raced.txHash}`);
+
 console.log(failures === 0 ? "\nAll Kurier checks passed." : `\n${failures} check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);
