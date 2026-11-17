@@ -109,6 +109,12 @@ async function handleTask(task, res) {
   }
 
   const input = task.input || {};
+  // Envelope timing visibility: the platform sets its own deadline_at per
+  // task (practice tasks appear to allow far less than the documented 60s).
+  // Logged once per task so scored-round latency can be audited afterwards.
+  console.log(
+    `[task ${taskId}] envelope mode=${task.mode || "?"} issued_at=${task.issued_at || "?"} deadline_at=${task.deadline_at || "?"}`
+  );
   const verdict = decide(input, state.seen);
   const response = {
     decision: verdict.decision,
