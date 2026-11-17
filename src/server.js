@@ -46,6 +46,11 @@ const STEAL_SALT = process.env.STEAL_SALT || DEFAULT_SALT;
 let STEAL_COMMITMENT = null;
 // Hard internal budget: answer well inside the platform's 60s deadline.
 const PROOF_BUDGET_MS = Number(process.env.PROOF_BUDGET_MS || 40000);
+// Total per-task response cap. The Kurier wait for Finalized (guide: a proof
+// counts as confirmed on-chain only once finalized) typically takes ~30s
+// end-to-end; cap the whole response at 50s so a slow chain can never turn
+// a scored task into a timeout — at the cap we answer with the proof alone.
+const RESPONSE_CAP_MS = Number(process.env.RESPONSE_CAP_MS || 50000);
 
 if (!SECRET) {
   console.error(
@@ -91,6 +96,7 @@ function withTimeout(promise, ms) {
 }
 
 async function handleTask(task, res) {
+  const startedAt = Date.now();
   const taskId = task.task_id;
   // Idempotency: platform retries get the identical signed response.
   const cached = taskId && state.getResponse(taskId);
@@ -123,13 +129,29 @@ async function handleTask(task, res) {
       response.proof = proof;
       response.public_signals = publicSignals;
       if (USE_KURIER) {
+        // Wait for the Kurier job to reach Finalized BEFORE responding: the
+        // platform only counts the proof as confirmed on-chain once its
+        // verification is finalized (Build guide; Round 4 returned at
+        // IncludedInBlock and still scored 0 verified). The wait is bounded
+        // by the remaining response budget (and the task's own deadline_at
+        // when present) so it can never cause a platform timeout. The
+        // response keeps exactly the contract fields — the tx hash is
+        // logged here for audit, not added as an extra response field.
         try {
-          const kurier = await submitToKurier(proof, publicSignals, VK_HASH, KURIER_API_KEY, 30000);
-          if (kurier.txHash) {
-            response.proof_reference = kurier.txHash;
-            console.log(`[task ${taskId}] Kurier ${kurier.status}: ${kurier.txHash}`);
+          let budget = RESPONSE_CAP_MS - (Date.now() - startedAt);
+          if (task.deadline_at) {
+            const untilDeadline = Date.parse(task.deadline_at) - Date.now() - 5000;
+            if (Number.isFinite(untilDeadline)) budget = Math.min(budget, untilDeadline);
+          }
+          if (budget > 3000) {
+            const kurier = await submitToKurier(proof, publicSignals, VK_HASH, KURIER_API_KEY, budget);
+            if (kurier.finalized) {
+              console.log(`[task ${taskId}] Kurier Finalized: ${kurier.txHash}`);
+            } else {
+              console.error(`[task ${taskId}] Kurier not finalized in time (status ${kurier.status}; proof still returned)`);
+            }
           } else {
-            console.error(`[task ${taskId}] Kurier not anchored in time (status ${kurier.status}; proof still returned)`);
+            console.error(`[task ${taskId}] Kurier skipped: only ${budget}ms of response budget left`);
           }
         } catch (e) {
           console.error(`[task ${taskId}] Kurier submit failed (proof still returned): ${e.message}`);
@@ -155,7 +177,8 @@ async function handleTask(task, res) {
   res.end(body);
   console.log(
     `[task ${taskId}] ${response.decision}/${response.reason_code}` +
-      (response.proof ? " +proof" : " (no proof)")
+      (response.proof ? " +proof" : " (no proof)") +
+      ` (${Date.now() - startedAt}ms)`
   );
 }
 

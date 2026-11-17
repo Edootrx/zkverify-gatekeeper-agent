@@ -85,17 +85,25 @@ export async function generateProof(circuitInput, wasmPath, zkeyPath) {
 
 // Kurier (zkVerify REST API) — REQUIRED for scored rounds, not optional.
 // The platform's "VERIFIED PROOFS" counter counts proofs confirmed ON-CHAIN,
-// and a provable task without an on-chain-confirmed proof scores -2 even when
-// the decision is correct (Round 3: 8x correct decisions, 0 verified, 80.0
-// points = 8 x (+12 - 2)). The proof itself is still returned to the platform
-// in every case; Kurier only adds the on-chain proof_reference.
+// and the Build guide sets the bar explicitly: "poll until the job reaches
+// Finalized", "Finalized — Safe to return as confirmed", and the Security
+// checklist's "The verification reached a finalized state before approval."
+// Evidence: Round 3 (no Kurier at all) -> 0 verified, 80.0 pts (8 x (+12-2)).
+// Round 4 (Kurier on, but the response went out at IncludedInBlock) -> STILL
+// 0 verified, +70. So the response must not be returned until the job is
+// Finalized; an in-block-but-unfinalized proof does not count as confirmed.
+// Measured 2026-11-17 with a live job: submit ~1.6s, IncludedInBlock ~9s,
+// Finalized ~29s after proof generation — inside the 60s platform deadline.
+// The response itself follows the published contract exactly:
+// { decision, reason_code, proof_tx, proof, public_signals }. The guide
+// defines NO proof_reference field for Gatekeeper and says "Do not add
+// fields the contract does not define", so the tx hash is kept in the
+// server logs only, never added to the response.
 //
 // Flow per docs.zkverify.io/overview/getting-started/kurier:
 //   1. register-vk ONCE per verification key (full vk JSON, not just the hash)
 //   2. submit-proof -> { jobId, optimisticVerify: 'success' }
-//   3. poll job-status until Finalized (example: ~16s) — txHash is present on
-//      the Finalized status object (and per the tutorial, tx data is returned
-//      once the job reaches IncludedInBlock).
+//   3. poll job-status until Finalized; txHash is present from Submitted on.
 // Enable with env SUBMIT_TO_KURIER=1 + KURIER_API_KEY (free key from kurier.xyz).
 export async function registerVk(vk, apiKey, timeoutMs = 15000) {
   const API = "https://api.kurier.xyz/api/v1";
@@ -123,7 +131,7 @@ export async function registerVk(vk, apiKey, timeoutMs = 15000) {
   }
 }
 
-export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 30000) {
+export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 45000) {
   const API = "https://api.kurier.xyz/api/v1";
   const res = await fetch(`${API}/submit-proof/${apiKey}`, {
     method: "POST",
@@ -143,25 +151,26 @@ export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeo
     throw new Error(`Kurier optimisticVerify=${job.optimisticVerify}`);
   }
   const jobId = job.jobId || job.id;
-  if (!jobId) return { txHash: null, status: "no-job-id", job };
+  if (!jobId) return { txHash: null, status: "no-job-id", finalized: false, job };
   const deadline = Date.now() + timeoutMs;
   let lastStatus = "Submitted";
+  let lastTxHash = null;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 2000));
     const s = await fetch(`${API}/job-status/${apiKey}/${jobId}`);
     if (!s.ok) continue;
     const st = await s.json();
     lastStatus = st.status || lastStatus;
-    // txHash appears once the verification is included in a block; Finalized
-    // is the strongest state. Either is an on-chain reference the platform
-    // can confirm, so return as soon as we have one.
-    if ((st.status === "Finalized" || st.status === "finalized" ||
-         st.status === "IncludedInBlock") && (st.txHash || st.transactionHash)) {
-      return { txHash: st.txHash || st.transactionHash, status: st.status, job: st };
+    if (st.txHash || st.transactionHash) lastTxHash = st.txHash || st.transactionHash;
+    // Return ONLY at Finalized: the platform counts a proof as confirmed
+    // on-chain only once its verification is finalized (see header comment).
+    // IncludedInBlock is not enough — Round 4 proved that empirically.
+    if (st.status === "Finalized" || st.status === "finalized") {
+      return { txHash: lastTxHash, status: st.status, finalized: true, job: st };
     }
     if (/fail|error|invalid/i.test(String(st.status))) throw new Error(`Kurier job ${st.status}`);
   }
-  // Not anchored in time — caller still returns the proof itself; the task
-  // will score +12 - 2 instead of +12, but never times out.
-  return { txHash: null, status: lastStatus, job };
+  // Not finalized within the caller's budget — the caller still returns the
+  // proof itself; the task scores like an unanchored one, but never times out.
+  return { txHash: lastTxHash, status: lastStatus, finalized: false, job };
 }

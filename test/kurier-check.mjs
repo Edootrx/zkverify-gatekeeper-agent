@@ -1,6 +1,8 @@
-// Local check for the Kurier integration (Round 3 fix) with a mocked fetch.
+// Local check for the Kurier integration with a mocked fetch.
 // No real API key, no network: validates register-vk payload, optimisticVerify
-// gating, IncludedInBlock/Finalized txHash extraction, and the timeout path.
+// gating, that submitToKurier returns ONLY at Finalized (an IncludedInBlock
+// txHash alone must not end the wait — Round 4 scored 0 verified that way),
+// and the budget-exhausted paths.
 import { registerVk, submitToKurier } from "../src/prover.js";
 
 let failures = 0;
@@ -33,14 +35,17 @@ check(
     calls[0].body.proofOptions.library === "snarkjs"
 );
 
-// 2. submit-proof -> IncludedInBlock with txHash returns the reference.
+// 2. submit-proof -> returns ONLY at Finalized, with the finalized txHash.
+//    The IncludedInBlock stage carries a different (early) txHash on purpose:
+//    if the wait ended there, this check fails.
 mockFetch([
   { json: { jobId: "job-1", optimisticVerify: "success" } },
   { json: { jobId: "job-1", status: "Submitted" } },
-  { json: { jobId: "job-1", status: "IncludedInBlock", txHash: "0xtxabc" } },
+  { json: { jobId: "job-1", status: "IncludedInBlock", txHash: "0xearly" } },
+  { json: { jobId: "job-1", status: "Finalized", txHash: "0xfinal" } },
 ]);
 const ok = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 30000);
-check("submit returns txHash at IncludedInBlock", ok.txHash === "0xtxabc", `got ${ok.txHash}`);
+check("submit returns at Finalized with its txHash", ok.finalized === true && ok.txHash === "0xfinal", `got status=${ok.status} tx=${ok.txHash}`);
 check("submit payload uses vkRegistered + vk hash", calls[1].body.vkRegistered === true && calls[1].body.proofData.vk === "0xvk");
 
 // 3. optimisticVerify != success throws (bad proof artifacts never finalize).
@@ -53,13 +58,22 @@ try {
 }
 check("optimisticVerify failure throws", threw);
 
-// 4. No txHash within budget -> txHash null (caller still returns the proof).
+// 4a. Stuck at IncludedInBlock until the budget ends -> finalized false
+//     (caller still returns the proof; txHash kept for logging).
 mockFetch([
   { json: { jobId: "job-3", optimisticVerify: "success" } },
-  { json: { jobId: "job-3", status: "Submitted" } },
+  { json: { jobId: "job-3", status: "IncludedInBlock", txHash: "0xearly" } },
 ]);
-const slow = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 100);
-check("timeout without anchor returns txHash null", slow.txHash === null, `status=${slow.status}`);
+const slow = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 4500);
+check("unfinalized at budget end returns finalized=false", slow.finalized === false && slow.status === "IncludedInBlock", `status=${slow.status}`);
+
+// 4b. No status ever arrives within a tiny budget -> txHash null.
+mockFetch([
+  { json: { jobId: "job-4", optimisticVerify: "success" } },
+  { json: { jobId: "job-4", status: "Submitted" } },
+]);
+const none = await submitToKurier({ pi_a: ["1"] }, ["2"], "0xvk", "key-123", 100);
+check("no anchor within budget returns txHash null", none.txHash === null && none.finalized === false, `status=${none.status}`);
 
 console.log(failures === 0 ? "\nAll Kurier checks passed." : `\n${failures} check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);
