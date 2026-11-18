@@ -105,8 +105,8 @@ export async function generateProof(circuitInput, wasmPath, zkeyPath) {
 //   2. submit-proof -> { jobId, optimisticVerify: 'success' }
 //   3. poll job-status until Finalized; txHash is present from Submitted on.
 // Enable with env SUBMIT_TO_KURIER=1 + KURIER_API_KEY (free key from kurier.xyz).
-export async function registerVk(vk, apiKey, timeoutMs = 15000) {
-  const API = "https://api.kurier.xyz/api/v1";
+export async function registerVk(vk, apiKey, timeoutMs = 15000, apiBase = "https://api.kurier.xyz/api/v1") {
+  const API = apiBase;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -131,8 +131,8 @@ export async function registerVk(vk, apiKey, timeoutMs = 15000) {
   }
 }
 
-export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 45000, stallMs = 18000) {
-  const API = "https://api.kurier.xyz/api/v1";
+export async function submitToKurier(proof, publicSignals, vkHash, apiKey, timeoutMs = 45000, stallMs = 18000, apiBase = "https://api.kurier.xyz/api/v1") {
+  const API = apiBase;
   const payload = {
     proofType: "groth16",
     vkRegistered: true,
